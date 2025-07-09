@@ -54,7 +54,7 @@ router.post('/deploy-bot', authenticateToken, async (req, res) => {
     
     if (force) {
       // Force deploy a bot regardless of queue status
-      const botService = require('../services/botService');
+      const botService = require('../services/BotService');
       const botUser = await botService.getBotForMatchmaking(gameType, entryFee);
       logger.info(`🤖 Force deployed bot ${botUser.name} (${botUser.id}) for testing`);
       

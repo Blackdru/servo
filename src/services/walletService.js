@@ -89,40 +89,80 @@ class WalletService {
 
   async createDepositOrder(userId, amount) {
     try {
+      logger.info(`Creating deposit order for user ${userId}, amount: ${amount}`);
+      
       const numericAmount = parseFloat(amount);
       if (isNaN(numericAmount) || numericAmount < 10) {
+        logger.warn(`Invalid deposit amount: ${amount} for user ${userId}`);
         throw new Error('Minimum deposit amount is ₹10');
       }
 
+      if (numericAmount > 50000) {
+        logger.warn(`Deposit amount too high: ${amount} for user ${userId}`);
+        throw new Error('Maximum deposit amount is ₹50,000');
+      }
+
       if (!this.razorpay) {
-        throw new Error('Payment gateway not configured');
+        logger.error('Razorpay not configured for deposit order creation');
+        throw new Error('Payment gateway not configured. Please try again later.');
+      }
+
+      // Check if user exists
+      const userExists = await prisma.user.findUnique({
+        where: { id: userId }
+      });
+
+      if (!userExists) {
+        logger.error(`User not found for deposit: ${userId}`);
+        throw new Error('User not found');
       }
 
       const options = {
-        amount: numericAmount * 100, // Convert to paise
+        amount: Math.round(numericAmount * 100), // Convert to paise and round
         currency: 'INR',
-        receipt: `deposit_${userId}_${Date.now()}`,
+        receipt: `dep_${userId.slice(0, 10)}_${Date.now()}`.slice(0, 40), // Ensure receipt is within limits
+        notes: {
+          userId: userId,
+          type: 'WALLET_DEPOSIT',
+          amount: numericAmount.toString()
+        }
       };
 
+      logger.info(`Creating Razorpay order with options:`, { ...options, notes: { ...options.notes, userId: 'HIDDEN' } });
+
       const order = await this.razorpay.orders.create(options);
+      logger.info(`Razorpay order created successfully: ${order.id}`);
       
       // Create pending transaction
-      await this.createTransaction(
+      const transaction = await this.createTransaction(
         userId,
         'DEPOSIT',
         numericAmount,
         'PENDING',
-        `Deposit of ₹${numericAmount}`,
+        `Wallet deposit of ₹${numericAmount}`,
         order.id
       );
 
+      logger.info(`Deposit transaction created: ${transaction.id} for order: ${order.id}`);
+
       return {
         success: true,
-        order: order
+        order: order,
+        transactionId: transaction.id
       };
     } catch (error) {
       logger.error(`Create deposit order error for user ${userId}:`, error);
-      throw error;
+      
+      // Provide more specific error messages
+      if (error.message.includes('Razorpay')) {
+        throw new Error('Payment gateway error. Please try again.');
+      } else if (error.message.includes('amount')) {
+        throw error; // Pass through amount validation errors
+      } else if (error.message.includes('User not found')) {
+        throw error; // Pass through user validation errors
+      } else {
+        throw new Error('Failed to create deposit order. Please try again.');
+      }
     }
   }
 

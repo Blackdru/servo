@@ -32,6 +32,45 @@ const memoryGameService = new MemoryGameService(io);
 // Socket authentication
 io.use(authenticateSocket);
 
+// Rate limiting for socket events
+const socketRateLimits = new Map();
+
+function checkRateLimit(userId, eventType, maxRequests = 5, windowMs = 10000) {
+  const key = `${userId}_${eventType}`;
+  const now = Date.now();
+  
+  if (!socketRateLimits.has(key)) {
+    socketRateLimits.set(key, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  
+  const limit = socketRateLimits.get(key);
+  
+  if (now > limit.resetTime) {
+    // Reset the window
+    limit.count = 1;
+    limit.resetTime = now + windowMs;
+    return true;
+  }
+  
+  if (limit.count >= maxRequests) {
+    return false;
+  }
+  
+  limit.count++;
+  return true;
+}
+
+// Cleanup rate limits periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, limit] of socketRateLimits.entries()) {
+    if (now > limit.resetTime) {
+      socketRateLimits.delete(key);
+    }
+  }
+}, 60000); // Clean up every minute
+
 // Socket connection handling
 io.on('connection', (socket) => {
   const userId = socket.user.id;
@@ -54,9 +93,18 @@ io.on('connection', (socket) => {
   // Setup game handlers - Only Memory Game
   memoryGameService.setupSocketHandlers(socket);
 
-  // Matchmaking events
+  // Matchmaking events with enhanced rate limiting
   socket.on('joinMatchmaking', async (data) => {
     try {
+      // Rate limit: max 3 requests per 10 seconds for matchmaking
+      if (!checkRateLimit(userId, 'joinMatchmaking', 3, 10000)) {
+        logger.warn(`Rate limit exceeded for joinMatchmaking by user ${userId}`);
+        return socket.emit('matchmakingError', { 
+          message: 'Too many requests. Please wait before trying again.',
+          code: 'RATE_LIMIT_EXCEEDED'
+        });
+      }
+
       logger.info(`🎯 User ${userId} (${userName}) attempting to join matchmaking:`, data);
       
       const { error, value } = gameSchemas.joinMatchmaking.validate(data);
@@ -88,6 +136,24 @@ io.on('connection', (socket) => {
 
       logger.info(`📝 Matchmaking request validated for user ${userId} (${userName}): ${gameType} ${maxPlayers}P ₹${entryFee}`);
 
+      // Check if user is already in queue to prevent duplicates
+      const existingQueueEntry = await prisma.matchmakingQueue.findFirst({
+        where: { userId }
+      });
+
+      if (existingQueueEntry) {
+        logger.info(`User ${userId} already in matchmaking queue, sending existing status`);
+        return socket.emit('matchmakingStatus', { 
+          status: 'waiting', 
+          message: 'Already in matchmaking queue',
+          gameType: existingQueueEntry.gameType,
+          maxPlayers: existingQueueEntry.maxPlayers,
+          entryFee: existingQueueEntry.entryFee,
+          playerName: userName,
+          playerId: userId
+        });
+      }
+
       await matchmakingService.joinQueue(userId, gameType, maxPlayers, entryFee);
       socket.emit('matchmakingStatus', { 
         status: 'waiting', 
@@ -104,6 +170,8 @@ io.on('connection', (socket) => {
       logger.error(`❌ Matchmaking join error for user ${userId} (${userName}):`, err);
       const message = err.message === 'Insufficient balance' 
         ? 'Insufficient balance to join this game'
+        : err.message === 'Already in matchmaking queue for this game'
+        ? 'Already in matchmaking queue'
         : 'Failed to join matchmaking';
       socket.emit('matchmakingError', { message });
     }
@@ -111,6 +179,14 @@ io.on('connection', (socket) => {
 
   socket.on('leaveMatchmaking', async () => {
     try {
+      // Rate limit: max 5 requests per 10 seconds for leaving
+      if (!checkRateLimit(userId, 'leaveMatchmaking', 5, 10000)) {
+        logger.warn(`Rate limit exceeded for leaveMatchmaking by user ${userId}`);
+        return socket.emit('matchmakingError', { 
+          message: 'Too many requests. Please wait before trying again.' 
+        });
+      }
+
       logger.info(`User ${userId} leaving matchmaking queue`);
       await matchmakingService.leaveQueue(userId);
       socket.emit('matchmakingStatus', { status: 'left', message: 'Left queue' });
@@ -121,16 +197,22 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Game events
+  // Game events with rate limiting
   socket.on('joinGameRoom', async (data) => {
-    const { gameId } = data || {};
-    
-    if (!gameId || typeof gameId !== 'string' || gameId.trim() === '') {
-      logger.warn(`Invalid gameId in joinGameRoom from user ${userId}:`, gameId);
-      return socket.emit('gameError', { message: 'Valid Game ID required' });
-    }
-
     try {
+      // Rate limit: max 5 requests per 10 seconds
+      if (!checkRateLimit(userId, 'joinGameRoom', 5, 10000)) {
+        logger.warn(`Rate limit exceeded for joinGameRoom by user ${userId}`);
+        return socket.emit('gameError', { message: 'Too many requests. Please wait.' });
+      }
+
+      const { gameId } = data || {};
+      
+      if (!gameId || typeof gameId !== 'string' || gameId.trim() === '') {
+        logger.warn(`Invalid gameId in joinGameRoom from user ${userId}:`, gameId);
+        return socket.emit('gameError', { message: 'Valid Game ID required' });
+      }
+
       const game = await gameService.getGameById(gameId);
       if (!game) {
         logger.warn(`Game not found for gameId ${gameId} from user ${userId}`);
@@ -163,9 +245,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Game action handlers - Only Memory Game
+  // Game action handlers with rate limiting
   socket.on('selectCard', async (data) => {
     try {
+      // Rate limit: max 10 requests per 5 seconds for card selection
+      if (!checkRateLimit(userId, 'selectCard', 10, 5000)) {
+        logger.warn(`Rate limit exceeded for selectCard by user ${userId}`);
+        return socket.emit('gameError', { message: 'Too many card selections. Please slow down.' });
+      }
+
       const { error, value } = gameSchemas.selectCard.validate(data);
       if (error) {
         return socket.emit('gameError', { message: error.details[0].message });
@@ -184,9 +272,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Additional game action handlers
+  // Additional game action handlers with rate limiting
   socket.on('makeMove', async (data) => {
     try {
+      // Rate limit: max 10 requests per 5 seconds
+      if (!checkRateLimit(userId, 'makeMove', 10, 5000)) {
+        return socket.emit('gameError', { message: 'Too many moves. Please slow down.' });
+      }
+
       const { gameId, moveData } = data || {};
       
       if (!gameId) {
@@ -217,6 +310,11 @@ io.on('connection', (socket) => {
 
   socket.on('getGameState', async (data) => {
     try {
+      // Rate limit: max 5 requests per 10 seconds
+      if (!checkRateLimit(userId, 'getGameState', 5, 10000)) {
+        return socket.emit('gameError', { message: 'Too many requests for game state.' });
+      }
+
       const { gameId } = data || {};
       
       if (!gameId) {
@@ -248,9 +346,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Chat functionality
+  // Chat functionality with rate limiting
   socket.on('sendChatMessage', async (data) => {
     try {
+      // Rate limit: max 10 messages per 30 seconds
+      if (!checkRateLimit(userId, 'sendChatMessage', 10, 30000)) {
+        return socket.emit('chatError', { message: 'Too many messages. Please slow down.' });
+      }
+
       const { gameId, message } = data || {};
       
       if (!gameId || !message || typeof message !== 'string' || message.trim().length === 0) {
@@ -289,9 +392,14 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Player status updates
+  // Player status updates with rate limiting
   socket.on('updatePlayerStatus', async (data) => {
     try {
+      // Rate limit: max 5 requests per 10 seconds
+      if (!checkRateLimit(userId, 'updatePlayerStatus', 5, 10000)) {
+        return socket.emit('gameError', { message: 'Too many status updates.' });
+      }
+
       const { gameId, status } = data || {};
       
       if (!gameId || !status) {
@@ -335,6 +443,15 @@ io.on('connection', (socket) => {
   socket.on('disconnect', (reason) => {
     logger.info(`User disconnected: ${userId} (${reason})`);
     socketManager.removeConnection(socket.id);
+
+    // Clean up rate limits for this user
+    const keysToDelete = [];
+    for (const key of socketRateLimits.keys()) {
+      if (key.startsWith(`${userId}_`)) {
+        keysToDelete.push(key);
+      }
+    }
+    keysToDelete.forEach(key => socketRateLimits.delete(key));
 
     // Update player status to disconnected in active games
     const userGames = socketManager.getUserGames(userId);
@@ -486,6 +603,10 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     connections: socketManager.getStats(),
     games: gameStateManager.getStats(),
+    rateLimits: {
+      activeUsers: socketRateLimits.size,
+      totalLimits: Array.from(socketRateLimits.values()).reduce((sum, limit) => sum + limit.count, 0)
+    },
     memory: {
       used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + ' MB',
       total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + ' MB',
@@ -550,6 +671,37 @@ app.get('/debug/sockets', (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to retrieve socket data'
+    });
+  }
+});
+
+app.get('/debug/rate-limits', (req, res) => {
+  try {
+    const rateLimitStats = {};
+    for (const [key, limit] of socketRateLimits.entries()) {
+      const [userId, eventType] = key.split('_');
+      if (!rateLimitStats[eventType]) {
+        rateLimitStats[eventType] = { users: 0, totalRequests: 0 };
+      }
+      rateLimitStats[eventType].users++;
+      rateLimitStats[eventType].totalRequests += limit.count;
+    }
+
+    res.json({
+      success: true,
+      totalActiveUsers: socketRateLimits.size,
+      eventStats: rateLimitStats,
+      recentLimits: Array.from(socketRateLimits.entries()).slice(0, 10).map(([key, limit]) => ({
+        key,
+        count: limit.count,
+        resetTime: new Date(limit.resetTime).toISOString()
+      }))
+    });
+  } catch (error) {
+    logger.error('Debug rate limits endpoint error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve rate limit data'
     });
   }
 });
@@ -674,6 +826,7 @@ async function startServer() {
       logger.info(`Server running on port ${PORT}`);
       logger.info(`Health check: http://localhost:${PORT}/health`);
       logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+      logger.info(`Rate limiting enabled for socket events`);
     });
     
     // Handle server errors

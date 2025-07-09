@@ -2,7 +2,7 @@
 const logger = require('../config/logger');
 const gameService = require('./gameService');
 const prisma = require('../config/database');
-const botService = require('./botService');
+const botService = require('./BotService');
 const GameplayController = require('../bot-system/services/GameplayController');
 const PerformanceBalancer = require('../bot-system/services/PerformanceBalancer');
 
