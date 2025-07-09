@@ -252,7 +252,23 @@ class MemoryGameService {
   }
 
   createGameBoard(roomId) {
-    const symbols = ['🎮', '🎯', '🎲', '🃏', '🎪', '🎨', '🎭', '💡', '🏸','🏎️', '🏀', '⚽', '🏈', '🏓', '🎾'];
+    const symbols = [
+  '🐉', // dragon
+  '🚀', // rocket
+  '🍩', // donut
+  '🎧', // headphones
+  '🧊', // ice cube
+  '🧬', // DNA
+  '🦾', // robot arm
+  '🦉', // owl
+  '⚡', // lightning
+  '🧨', // firecracker
+  '🪄', // magic wand
+  '🎸', // guitar
+  '🧿', // nazar (evil eye)
+  '🪙', // coin
+  '🔮'  // crystal ball
+];
     const cards = [];
     
     // Create pairs - use all 15 symbols for 30 cards (15 pairs)

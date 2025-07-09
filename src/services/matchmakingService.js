@@ -2,7 +2,7 @@ const prisma = require('../config/database');
 const logger = require('../config/logger');
 const walletService = require('./walletService');
 const gameService = require('./gameService'); // For initializing game board based on game type
-const botService = require('./BotService'); // For bot players
+const botService = require('./botService'); // For bot players
 
 class MatchmakingService {
   constructor() {

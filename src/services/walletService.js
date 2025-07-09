@@ -16,6 +16,9 @@ class WalletService {
       });
       logger.info('Razorpay instance initialized.');
     }
+    
+    // Track ongoing deductions to prevent race conditions
+    this.ongoingDeductions = new Set();
   }
 
   async getWallet(userId) {
@@ -419,106 +422,173 @@ class WalletService {
         throw new Error('Invalid amount for game entry');
       }
 
-      // Check if there's already a transaction for this user and game (prevent double deduction)
-      const existingTransaction = await prisma.transaction.findFirst({
-        where: {
-          userId,
-          gameId,
-          type: 'GAME_ENTRY',
-          status: 'COMPLETED'
-        }
-      });
-
-      if (existingTransaction) {
-        logger.warn(`❌ Duplicate game entry attempt: User ${userId} already has entry fee deducted for game ${gameId} (Transaction: ${existingTransaction.id})`);
+      // Create unique key for this deduction to prevent race conditions
+      const deductionKey = `${userId}_${gameId}`;
+      
+      // Check if this deduction is already in progress
+      if (this.ongoingDeductions.has(deductionKey)) {
+        logger.warn(`❌ Deduction already in progress: User ${userId}, Game ${gameId}`);
         return { 
           success: false, 
-          message: 'Entry fee already deducted for this game',
-          transactionId: existingTransaction.id
+          message: 'Entry fee deduction already in progress for this game'
         };
       }
 
-      const wallet = await this.getWallet(userId);
+      // Mark deduction as in progress
+      this.ongoingDeductions.add(deductionKey);
 
-      // Check if user has enough total balance (gameBalance + withdrawableBalance)
-      const totalAvailable = parseFloat(wallet.gameBalance) + parseFloat(wallet.withdrawableBalance);
-      if (totalAvailable < numericAmount) {
-        logger.warn(`Insufficient balance: User ${userId}, Has: ₹${totalAvailable} (Game: ₹${wallet.gameBalance} + Withdrawable: ₹${wallet.withdrawableBalance}), Wants: ₹${numericAmount}`);
-        return { success: false, message: 'Insufficient balance' };
-      }
-
-      const result = await prisma.$transaction(async (tx) => {
-        // Double-check for existing transaction within the transaction (race condition protection)
-        const existingTxInTransaction = await tx.transaction.findFirst({
+      try {
+        // Enhanced duplicate detection with multiple checks
+        const existingTransactions = await prisma.transaction.findMany({
           where: {
             userId,
             gameId,
             type: 'GAME_ENTRY',
-            status: 'COMPLETED'
-          }
+            status: { in: ['COMPLETED', 'PENDING'] }
+          },
+          orderBy: { createdAt: 'desc' }
         });
 
-        if (existingTxInTransaction) {
-          throw new Error(`Entry fee already deducted for game ${gameId}`);
+        if (existingTransactions.length > 0) {
+          const latestTransaction = existingTransactions[0];
+          logger.warn(`❌ Duplicate game entry attempt: User ${userId} already has ${existingTransactions.length} entry fee transaction(s) for game ${gameId} (Latest: ${latestTransaction.id})`);
+          return { 
+            success: false, 
+            message: 'Entry fee already deducted for this game',
+            transactionId: latestTransaction.id,
+            duplicateCount: existingTransactions.length
+          };
         }
 
-        // Create transaction
-        const transaction = await tx.transaction.create({
-          data: {
-            userId,
-            type: 'GAME_ENTRY',
-            amount: numericAmount,
-            status: 'COMPLETED',
-            description: `Game entry fee for game ${gameId}`,
-            gameId
-          }
-        });
+        const wallet = await this.getWallet(userId);
 
-        // Deduct from available balances (prioritize gameBalance first, then withdrawableBalance)
-        const currentWallet = await tx.wallet.findUnique({ where: { userId } });
-        const gameBalanceAvailable = parseFloat(currentWallet.gameBalance);
-        const withdrawableBalanceAvailable = parseFloat(currentWallet.withdrawableBalance);
-        
-        let gameBalanceDeduction = 0;
-        let withdrawableBalanceDeduction = 0;
-        
-        if (gameBalanceAvailable >= numericAmount) {
-          // Deduct entirely from game balance
-          gameBalanceDeduction = numericAmount;
-        } else {
-          // Deduct what we can from game balance, rest from withdrawable balance
-          gameBalanceDeduction = gameBalanceAvailable;
-          withdrawableBalanceDeduction = numericAmount - gameBalanceAvailable;
+        // Check if user has enough total balance (gameBalance + withdrawableBalance)
+        const totalAvailable = parseFloat(wallet.gameBalance) + parseFloat(wallet.withdrawableBalance);
+        if (totalAvailable < numericAmount) {
+          logger.warn(`Insufficient balance: User ${userId}, Has: ₹${totalAvailable} (Game: ₹${wallet.gameBalance} + Withdrawable: ₹${wallet.withdrawableBalance}), Wants: ₹${numericAmount}`);
+          return { success: false, message: 'Insufficient balance' };
         }
-        
-        const updatedWallet = await tx.wallet.update({
-          where: { userId },
-          data: {
-            balance: { decrement: numericAmount },
-            gameBalance: { decrement: gameBalanceDeduction },
-            withdrawableBalance: { decrement: withdrawableBalanceDeduction }
+
+        // Use serializable transaction isolation to prevent race conditions
+        const result = await prisma.$transaction(async (tx) => {
+          // Triple-check for existing transaction within the transaction
+          const existingTxInTransaction = await tx.transaction.findMany({
+            where: {
+              userId,
+              gameId,
+              type: 'GAME_ENTRY',
+              status: { in: ['COMPLETED', 'PENDING'] }
+            }
+          });
+
+          if (existingTxInTransaction.length > 0) {
+            throw new Error(`Entry fee already deducted for game ${gameId} - found ${existingTxInTransaction.length} existing transactions`);
           }
+
+          // Create transaction with unique constraint check
+          const transaction = await tx.transaction.create({
+            data: {
+              userId,
+              type: 'GAME_ENTRY',
+              amount: numericAmount,
+              status: 'COMPLETED',
+              description: `Game entry fee for game ${gameId}`,
+              gameId,
+              metadata: {
+                deductionTimestamp: new Date().toISOString(),
+                preventDuplicateKey: `${userId}_${gameId}_${Date.now()}`,
+                deductionAttemptId: deductionKey
+              }
+            }
+          });
+
+          // Get current wallet state within transaction
+          const currentWallet = await tx.wallet.findUnique({ 
+            where: { userId }
+          });
+          
+          if (!currentWallet) {
+            throw new Error('Wallet not found');
+          }
+
+          const gameBalanceAvailable = parseFloat(currentWallet.gameBalance);
+          const withdrawableBalanceAvailable = parseFloat(currentWallet.withdrawableBalance);
+          const currentTotalAvailable = gameBalanceAvailable + withdrawableBalanceAvailable;
+          
+          // Re-check balance within transaction
+          if (currentTotalAvailable < numericAmount) {
+            throw new Error(`Insufficient balance in transaction: Has ₹${currentTotalAvailable}, Needs ₹${numericAmount}`);
+          }
+          
+          let gameBalanceDeduction = 0;
+          let withdrawableBalanceDeduction = 0;
+          
+          if (gameBalanceAvailable >= numericAmount) {
+            // Deduct entirely from game balance
+            gameBalanceDeduction = numericAmount;
+          } else {
+            // Deduct what we can from game balance, rest from withdrawable balance
+            gameBalanceDeduction = gameBalanceAvailable;
+            withdrawableBalanceDeduction = numericAmount - gameBalanceAvailable;
+          }
+          
+          const updatedWallet = await tx.wallet.update({
+            where: { userId },
+            data: {
+              balance: { decrement: numericAmount },
+              gameBalance: { decrement: gameBalanceDeduction },
+              withdrawableBalance: { decrement: withdrawableBalanceDeduction }
+            }
+          });
+
+          return { transaction, wallet: updatedWallet };
+        }, {
+          isolationLevel: 'Serializable', // Highest isolation level to prevent race conditions
+          maxWait: 5000, // Wait up to 5 seconds for transaction slot
+          timeout: 10000, // Transaction timeout of 10 seconds
         });
 
-        return { transaction, wallet: updatedWallet };
-      });
+        logger.info(`✅ Game entry deducted: User ${userId}, Amount: ${numericAmount}, Game: ${gameId}, TransId: ${result.transaction.id}`);
 
-      logger.info(`✅ Game entry deducted: User ${userId}, Amount: ${numericAmount}, Game: ${gameId}, TransId: ${result.transaction.id}`);
+        return {
+          success: true,
+          balance: parseFloat(result.wallet.balance),
+          gameBalance: parseFloat(result.wallet.gameBalance),
+          withdrawableBalance: parseFloat(result.wallet.withdrawableBalance),
+          transactionId: result.transaction.id
+        };
 
-      return {
-        success: true,
-        balance: parseFloat(result.wallet.balance),
-        gameBalance: parseFloat(result.wallet.gameBalance),
-        withdrawableBalance: parseFloat(result.wallet.withdrawableBalance),
-        transactionId: result.transaction.id
-      };
+      } finally {
+        // Always remove from ongoing deductions
+        this.ongoingDeductions.delete(deductionKey);
+      }
+
     } catch (error) {
       logger.error(`❌ Deduct game entry error for user ${userId}, game ${gameId}:`, error);
       
-      if (error.message.includes('Entry fee already deducted')) {
+      // Clean up ongoing deductions on error
+      const deductionKey = `${userId}_${gameId}`;
+      this.ongoingDeductions.delete(deductionKey);
+      
+      if (error.message.includes('Entry fee already deducted') || error.message.includes('existing transactions')) {
         return { 
           success: false, 
-          message: error.message
+          message: 'Entry fee already deducted for this game',
+          error: error.message
+        };
+      }
+      
+      if (error.message.includes('Insufficient balance')) {
+        return {
+          success: false,
+          message: 'Insufficient balance'
+        };
+      }
+      
+      if (error.message.includes('already in progress')) {
+        return {
+          success: false,
+          message: 'Entry fee deduction already in progress'
         };
       }
       
