@@ -438,6 +438,7 @@ class MemoryGameService {
       if (gameState.selectedCards.length === 2) {
         // Clear timer now that turn is complete
         this.clearTurnTimer(gameId);
+        // Keep processing flag true during match processing
         // Process match with minimal delay for better UX
         setTimeout(() => this.processMatch(gameId), 100);
       } else {
@@ -532,22 +533,39 @@ class MemoryGameService {
         });
 
       } else {
-        // No match - flip back immediately and change turn
-        gameState.board[card1.position].isFlipped = false;
-        gameState.board[card2.position].isFlipped = false;
+        // No match - show cards for 700ms before flipping back and changing turn
         
         // Bot memory update for mismatched cards
         this.updateBotMemories(gameId, [card1, card2], false);
         
-        // Emit mismatch event with immediate flip back
-        this.io.to(`game:${gameId}`).emit('MEMORY_CARDS_MISMATCHED', {
+        // Emit mismatch event but keep cards visible
+        this.io.to(`game:${gameId}`).emit('MEMORY_CARDS_NO_MATCH', {
           positions: [card1.position, card2.position],
-          symbols: [card1.symbol, card2.symbol],
-          nextPlayerName: gameState.players[(gameState.currentTurnIndex + 1) % gameState.players.length].name
+          symbols: [card1.symbol, card2.symbol]
         });
 
-        // Change turn immediately
-        this.nextTurn(gameId);
+        // Wait 700ms before flipping back and changing turn
+        setTimeout(() => {
+          const currentGameState = this.games.get(gameId);
+          if (!currentGameState) return;
+          
+          // Flip cards back
+          currentGameState.board[card1.position].isFlipped = false;
+          currentGameState.board[card2.position].isFlipped = false;
+          
+          // Clear processing state
+          currentGameState.selectedCards = [];
+          currentGameState.processingCards = false;
+          
+          // Emit cards flipped back event
+          this.io.to(`game:${gameId}`).emit('MEMORY_CARDS_MISMATCHED', {
+            positions: [card1.position, card2.position],
+            nextPlayerName: currentGameState.players[(currentGameState.currentTurnIndex + 1) % currentGameState.players.length].name
+          });
+
+          // Change turn after delay
+          this.nextTurn(gameId);
+        }, 700);
       }
 
       // Update database (non-blocking)
