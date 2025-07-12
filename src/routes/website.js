@@ -3,6 +3,7 @@ const router = express.Router();
 const prisma = require('../config/database');
 const logger = require('../config/logger');
 const Joi = require('joi');
+const trackingService = require('../services/trackingService');
 
 // Validation schemas
 const contactSchema = Joi.object({
@@ -206,22 +207,63 @@ router.post('/newsletter', async (req, res) => {
   }
 });
 
+// Visitor tracking
+router.post('/track-visitor', async (req, res) => {
+  try {
+    const {
+      sessionId,
+      referrer,
+      landingPage,
+      country,
+      city
+    } = req.body;
+
+    if (!sessionId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Session ID is required'
+      });
+    }
+
+    const visitor = await trackingService.trackVisitor({
+      sessionId,
+      ipAddress: req.ip || req.connection.remoteAddress,
+      userAgent: req.get('User-Agent'),
+      referrer,
+      landingPage,
+      country,
+      city
+    });
+
+    res.json({
+      success: true,
+      message: 'Visitor tracked successfully',
+      visitorId: visitor.id
+    });
+  } catch (error) {
+    logger.error('Visitor tracking error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to track visitor'
+    });
+  }
+});
+
 // Download tracking
 router.post('/download-track', async (req, res) => {
   try {
-    const { source = 'website', userAgent, ip } = req.body;
+    const { sessionId, source = 'website' } = req.body;
 
-    // Track download
-    await prisma.downloadTracking.create({
-      data: {
-        source: source.toLowerCase(),
-        userAgent: userAgent || req.get('User-Agent') || 'unknown',
-        ipAddress: ip || req.ip || 'unknown',
-        timestamp: new Date()
-      }
-    });
+    if (!sessionId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Session ID is required'
+      });
+    }
 
-    logger.info(`APK download tracked from ${source}`);
+    await trackingService.trackDownload(sessionId, source);
+
+    logger.info(`APK download tracked for session ${sessionId}`);
 
     res.json({
       success: true,
@@ -233,6 +275,74 @@ router.post('/download-track', async (req, res) => {
     res.json({
       success: true,
       message: 'Download initiated'
+    });
+  }
+});
+
+// Update visit duration
+router.post('/update-duration', async (req, res) => {
+  try {
+    const { sessionId, duration } = req.body;
+
+    if (!sessionId || !duration) {
+      return res.status(400).json({
+        success: false,
+        message: 'Session ID and duration are required'
+      });
+    }
+
+    await trackingService.updateVisitDuration(sessionId, duration);
+
+    res.json({
+      success: true,
+      message: 'Visit duration updated'
+    });
+  } catch (error) {
+    logger.error('Visit duration update error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update visit duration'
+    });
+  }
+});
+
+// Get analytics
+router.get('/analytics', async (req, res) => {
+  try {
+    const { timeframe = '7d' } = req.query;
+    const analytics = await trackingService.getAnalytics(timeframe);
+
+    res.json({
+      success: true,
+      analytics
+    });
+  } catch (error) {
+    logger.error('Analytics error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve analytics'
+    });
+  }
+});
+
+// Get visitor details
+router.get('/visitors', async (req, res) => {
+  try {
+    const { limit = 100, offset = 0 } = req.query;
+    const result = await trackingService.getVisitorDetails(
+      parseInt(limit),
+      parseInt(offset)
+    );
+
+    res.json({
+      success: true,
+      ...result
+    });
+  } catch (error) {
+    logger.error('Visitor details error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve visitor details'
     });
   }
 });

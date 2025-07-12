@@ -617,234 +617,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoints
-app.get('/debug/queue', async (req, res) => {
-  try {
-    const queueEntries = await prisma.matchmakingQueue.findMany({
-      include: { user: true }
-    });
-    
-    res.json({
-      success: true,
-      queueCount: queueEntries.length,
-      entries: queueEntries.map(entry => ({
-        id: entry.id,
-        userId: entry.userId,
-        userName: entry.user.name,
-        gameType: entry.gameType,
-        maxPlayers: entry.maxPlayers,
-        entryFee: entry.entryFee,
-        createdAt: entry.createdAt
-      }))
-    });
-  } catch (error) {
-    logger.error('Debug queue endpoint error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve queue data'
-    });
-  }
-});
-
-app.get('/debug/sockets', (req, res) => {
-  try {
-    const connectedSockets = io.sockets.sockets;
-    const socketIds = Array.from(connectedSockets.keys());
-    const sockets = socketIds.map(id => {
-      const socket = connectedSockets.get(id);
-      return {
-        id: socket.id,
-        userId: socket.user?.id,
-        userName: socket.user?.name,
-        connectedAt: socket.handshake.time,
-        address: socket.handshake.address,
-      };
-    });
-
-    res.json({
-      success: true,
-      totalConnections: connectedSockets.size,
-      sockets: sockets,
-    });
-  } catch (error) {
-    logger.error('Debug sockets endpoint error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve socket data'
-    });
-  }
-});
-
-app.get('/debug/rate-limits', (req, res) => {
-  try {
-    const rateLimitStats = {};
-    for (const [key, limit] of socketRateLimits.entries()) {
-      const [userId, eventType] = key.split('_');
-      if (!rateLimitStats[eventType]) {
-        rateLimitStats[eventType] = { users: 0, totalRequests: 0 };
-      }
-      rateLimitStats[eventType].users++;
-      rateLimitStats[eventType].totalRequests += limit.count;
-    }
-
-    res.json({
-      success: true,
-      totalActiveUsers: socketRateLimits.size,
-      eventStats: rateLimitStats,
-      recentLimits: Array.from(socketRateLimits.entries()).slice(0, 10).map(([key, limit]) => ({
-        key,
-        count: limit.count,
-        resetTime: new Date(limit.resetTime).toISOString()
-      }))
-    });
-  } catch (error) {
-    logger.error('Debug rate limits endpoint error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve rate limit data'
-    });
-  }
-});
-
-app.get('/debug/games', (req, res) => {
-  try {
-    const gameStats = gameStateManager.getStats();
-    res.json({
-      success: true,
-      gameStats: gameStats
-    });
-  } catch (error) {
-    logger.error('Debug games endpoint error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve game data'
-    });
-  }
-});
-
-app.get('/debug/bots', async (req, res) => {
-  try {
-    const totalBots = await prisma.user.count({
-      where: { isBot: true }
-    });
-    
-    const availableBots = await botService.getAvailableBotsCount();
-    
-    const botsInQueue = await prisma.matchmakingQueue.count({
-      where: {
-        user: { isBot: true }
-      }
-    });
-    
-    const botsInGames = await prisma.gameParticipation.count({
-      where: {
-        user: { isBot: true },
-        game: {
-          status: {
-            in: ['WAITING', 'PLAYING']
-          }
-        }
-      }
-    });
-    
-    const botTimers = matchmakingService.botDeploymentTimers.size;
-    
-    // Get advanced bot statistics
-    const recentGameCount = await prisma.game.count({
-      where: {
-        status: 'FINISHED',
-        finishedAt: {
-          gte: new Date(Date.now() - 24 * 60 * 60 * 1000) // Last 24 hours
-        },
-        participants: {
-          some: {
-            user: { isBot: true }
-          }
-        }
-      }
-    });
-    
-    res.json({
-      success: true,
-      botStats: {
-        totalBots,
-        availableBots,
-        botsInQueue,
-        botsInGames,
-        activeTimers: botTimers,
-        advancedSystem: {
-          recentGamesWithBots: recentGameCount,
-          performanceBalancing: 'Active',
-          winRateTarget: '50%'
-        }
-      }
-    });
-  } catch (error) {
-    logger.error('Debug bots endpoint error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve bot data'
-    });
-  }
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  logger.error('Express error:', err);
-  res.status(err.statusCode || 500).json({
-    success: false,
-    message: err.message || 'Internal server error',
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
-  });
-});
-
-const PORT = process.env.PORT || 8080;
-
-// Start server
-async function startServer() {
-  try {
-    // Test database connection
-    await prisma.$connect();
-    logger.info('Database connected successfully');
-    
-    // Initialize services
-    await matchmakingService.initialize();
-    logger.info('Matchmaking service initialized');
-    
-    await gameStateManager.initialize();
-    logger.info('Game state manager initialized');
-    
-    // Ensure minimum bots are available
-    await botService.ensureMinimumBots(10);
-    logger.info('Bot service initialized with minimum bots');
-    
-    // Initialize advanced bot performance tracking
-    logger.info('Advanced bot system initialized with 50% win rate balancing');
-    
-    // Start HTTP server
-    server.listen(PORT, () => {
-      logger.info(`Server running on port ${PORT}`);
-      logger.info(`Health check: http://localhost:${PORT}/health`);
-      logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
-      logger.info(`Rate limiting enabled for socket events`);
-    });
-    
-    // Handle server errors
-    server.on('error', (error) => {
-      if (error.code === 'EADDRINUSE') {
-        logger.error(`Port ${PORT} is already in use`);
-      } else {
-        logger.error('Server error:', error);
-      }
-      process.exit(1);
-    });
-    
-  } catch (error) {
-    logger.error('Failed to start server:', error);
-    process.exit(1);
-  }
-}
-
 // Graceful shutdown
 const shutdown = async (signal) => {
   logger.info(`Received ${signal}. Shutting down gracefully...`);
@@ -946,6 +718,45 @@ setInterval(() => {
 }, 2 * 60 * 1000); // Every 2 minutes
 
 // Start the server
+async function startServer() {
+  try {
+    const PORT = process.env.PORT || 8080;
+    
+    server.listen(PORT, () => {
+      logger.info(`🚀 Budzee Gaming Server started on port ${PORT}`);
+      logger.info(`🎮 Environment: ${process.env.NODE_ENV || 'development'}`);
+      logger.info(`🔗 Health check: http://localhost:${PORT}/health`);
+      logger.info(`📊 Socket.IO enabled for real-time gaming`);
+      
+      // Log available routes
+      logger.info('📋 Available API routes:');
+      logger.info('  - /api/auth/* - Authentication');
+      logger.info('  - /api/wallet/* - Wallet management');
+      logger.info('  - /api/game/* - Game operations');
+      logger.info('  - /api/matchmaking/* - Matchmaking');
+      logger.info('  - /api/profile/* - User profiles');
+      logger.info('  - /api/payment/* - Payment processing');
+      logger.info('  - /api/feedback/* - User feedback');
+      logger.info('  - /api/website/* - Website tracking & analytics');
+      logger.info('  - /health - Health check endpoint');
+    });
+    
+    server.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        logger.error(`❌ Port ${PORT} is already in use`);
+        process.exit(1);
+      } else {
+        logger.error('❌ Server error:', error);
+        process.exit(1);
+      }
+    });
+    
+  } catch (error) {
+    logger.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
 startServer();
 
 module.exports = { app, server, io };

@@ -422,3 +422,26 @@ model DownloadTracking {
 
   @@map("download_tracking")
 }
+
+model VisitorTracking {
+  id            String   @id @default(cuid())
+  sessionId     String   @map("session_id")
+  ipAddress     String?  @map("ip_address")
+  userAgent     String?  @map("user_agent")
+  country       String?
+  city          String?
+  device        String?
+  browser       String?
+  os            String?
+  referrer      String?
+  landingPage   String?  @map("landing_page")
+  visitDuration Int?     @map("visit_duration") // in seconds
+  pageViews     Int      @default(1) @map("page_views")
+  appDownloaded Boolean  @default(false) @map("app_downloaded")
+  downloadedAt  DateTime? @map("downloaded_at")
+  firstVisit    DateTime @default(now()) @map("first_visit")
+  lastVisit     DateTime @default(now()) @map("last_visit")
+  isReturning   Boolean  @default(false) @map("is_returning")
+
+  @@map("visitor_tracking")
+}
